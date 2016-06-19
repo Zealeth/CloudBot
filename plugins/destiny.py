@@ -4,12 +4,11 @@ from cloudbot import hook
 from html.parser import HTMLParser
 from random import sample
 from requests import get
-from pickle import dump, load
 from feedparser import parse
 from cloudbot.util.web import try_shorten
+from tinydb import TinyDB, Query
 
 BASE_URL = 'https://www.bungie.net/platform/Destiny/'
-CACHE = {}
 CLASS_TYPES = {0: 'Titan ', 1: 'Hunter ', 2: 'Warlock ', 3: ''}
 CLASS_HASH = {671679327: 'Hunter', 3655393761: 'Titan', 2271682572: 'Warlock'}
 RACE_HASH = {898834093: 'Exo', 3887404748: 'Human', 2803282938: 'Awoken'}
@@ -65,18 +64,23 @@ def string_to_datetime(datetime_as_string):
 def datetime_to_string(datetime_object):
     return datetime.datetime.strftime(datetime_object,'%Y-%m-%dT%H:%M:%SZ')
 
-def get_user(user_name, console=None):
+def get_user(user_name, console=None, cached=True):
     '''
     Takes in a username and returns a dictionary of all systems they are
     on as well as their associated id for that system, plus general information
     '''
-    platforms = CACHE['links'].get(user_name, {console: user_name})
+    global LINKS, USERS
 
-    if CACHE.get(user_name, None):
-        return CACHE[user_name]
+    user = USERS.get(DB_Q.nick == user_name)
+    if user and cached:
+        return {x: user[x] for x in user if x != 'nick'}  # don't return nick info
     else:
+        platforms = LINKS.search(DB_Q.nick == user_name)
+        platforms = {console: user_name} if not platforms else platforms
         user_info = {}
         for platform in platforms:
+            if platform not in [1, 2]:
+                continue
             gamertag = platforms[platform]
             try:
                 # Get the Destiny membership ID
@@ -105,37 +109,45 @@ def get_user(user_name, console=None):
             }
             user_info[platform] = user_dict
 
-        CACHE[user_name] = user_info
+        user = USERS.get(DB_Q.nick == user_name)
+        if user:
+            USERS.update(user_info, eids=[user.eid])
+        else:
+            eid = USERS.insert({'nick': user_name})
+            USERS.update(user_info, eids=[eid])
         return user_info if user_info else 'A user by the name {} was not found.'.format(user_name)
 
 def prepare_lore_cache():
     '''
-   This function will allow us to do this: LORE_CACHE[name]['cardIntro']
+   Store the current lore in our database
    '''
     lore_base = get('{}/Vanguard/Grimoire/Definition/'.format(BASE_URL),
         headers=HEADERS).json()['Response']['themeCollection']
 
-    global LORE_CACHE
-    LORE_CACHE = {}
+    global LORE, COLLECTIONS
+    LORE.purge()
+    COLLECTIONS.purge()
     grim_tally = 0
     fragments = {}
     for level1 in lore_base:
-        if level1.get('themeId','') == 'Enemies':
+        if level1.get('themeId', '') == 'Enemies':
             for page in level1['pageCollection']:
                 if page['pageId'] == 'BooksofSorrow':
                     for card in page['cardCollection']:
                         fragments[card['cardId']] = card['cardName']
         for level2 in level1.get('pageCollection', []):
             for card in level2.get('cardCollection', []):
-                LORE_CACHE[card['cardName']] = {
+                LORE.insert({
+                    'cardName': card['cardName'],
                     'cardIntro': card.get('cardIntro', ''),
                     'cardDescription': card['cardDescription'],
                     'cardId': card['cardId']
-                }
+                })
             for card in level2.get('cardBriefs', []):
                 grim_tally += card.get('totalPoints', 0)
-    CACHE['collections']['grim_tally'] = grim_tally
-    CACHE['collections']['fragments'] = fragments
+    COLLECTIONS.insert({'ghost_tally': 103})
+    COLLECTIONS.insert({'grim_tally': grim_tally})
+    COLLECTIONS.insert({'fragments': fragments})
 
 
 def best_weapon(data):
@@ -202,33 +214,49 @@ def get_stat(data, stat):
     else:
         return 'Invalid option {}'.format(stat)
 
-@hook.on_start()
-def load_cache(bot):
-    '''Load in our pickle cache and the Headers'''
-    global HEADERS
-    HEADERS = {'X-API-Key': bot.config.get('api_keys', {}).get('destiny', None)}
-    try:
-        with open('destiny_cache', 'rb') as f:
-            global CACHE
-            CACHE = load(f)  # and the pickles!!!
-    except EOFError:
-        CACHE = {}
-    except FileNotFoundError:
-        CACHE = {}
+def in_lower(val, target):
+    """Helper function for tinydb searches."""
+    return target.lower() in val.lower()
 
-    CACHE.pop('collections', None)
-    if not CACHE.get('links'):
-        CACHE['links'] = {}
-    if not CACHE.get('collections'):
-        CACHE['collections'] = {'ghost_tally': 99}
-    try:
-        with open('lore_cache', 'rb') as f:
-            global LORE_CACHE
-            LORE_CACHE = load(f)  # and the pickles!!!
-    except EOFError:
-        LORE_CACHE = {}
-    except FileNotFoundError:
-        LORE_CACHE = {}
+@hook.periodic(300, initial_interval=300)
+def check_updates(message, bot):
+    """Check to see if there have been any updates from Bungie."""
+    global CACHE
+    twt1, twt2 = tweets(bot)
+    fd = news(bot, chan=None)
+    output = []
+    updates = CACHE.get(DB_Q.updates.exists())
+    if not updates:
+        CACHE.insert({'updates': [twt1, twt2, fd]})
+        output = [twt1, twt2, fd]
+    else:
+        if updates['updates'][0][50] != twt1[50]:
+            updates['updates'][0] = twt1
+            output.append(twt1)
+        if updates['updates'][1][50] != twt2[50]:
+            updates['updates'][1] = twt2
+            output.append(twt2)
+        if updates['updates'][2] != fd:
+            updates['updates'][2] = fd
+            output.append(fd)
+        CACHE.update(updates, eids=[updates.eid])
+    for conn in bot.connections:
+        for chan in CACHE.get(DB_Q.channels.exists()).get('channels', None):
+            for update in output:
+                bot.connections[conn].message(chan, update)
+
+@hook.on_start()
+def load_db(bot, conn):
+    """Load in our database and the Headers."""
+    global CACHE, USERS, LORE, COLLECTIONS, LINKS, DB_Q, HEADERS
+    CACHE = TinyDB('destiny.json')
+    USERS = CACHE.table('users')
+    LORE = CACHE.table('lore')
+    COLLECTIONS = CACHE.table('collections')
+    LINKS = CACHE.table('links')
+    DB_Q = Query()  # This is our query object used. Use it in all queries.
+    HEADERS = {'X-API-Key': bot.config.get('api_keys', {}).get('destiny', None)}
+
 
 def compile_stats(text, nick, bot, opts, defaults, split_defaults, st_type, notice):
     if not text:
@@ -285,7 +313,7 @@ def compile_stats(text, nick, bot, opts, defaults, split_defaults, st_type, noti
         output.append('{}: {}'.format(CONSOLES[console - 1], ', '.join(tmp_out)))
     return '\x02{0}\x02: {1}'.format(target['nick'], '; '.join(output))
 
-def compile_stats_arg_parse(text_arr, given_nick):
+def compile_stats_arg_parse(text_arr, given_nick, cached=True):
     '''Parse the input
 
     :param textArr: the input text array to parse
@@ -313,11 +341,11 @@ def compile_stats_arg_parse(text_arr, given_nick):
             console = CONSOLES[check_arg]
             if user:
                 # better run it again
-                user = get_user(nick, CONSOLE2ID[console])
+                user = get_user(nick, CONSOLE2ID[console], cached=cached)
             elif collect:
                 # gamertag may have been given, try it
                 for i, arg in enumerate(collect):
-                    user = get_user(arg, CONSOLE2ID[console])
+                    user = get_user(arg, CONSOLE2ID[console], cached=cached)
                     if not isinstance(user, str):
                         # Gamertag given, found, remove it.
                         collect.pop(i)
@@ -328,10 +356,10 @@ def compile_stats_arg_parse(text_arr, given_nick):
         elif not nick:
             if console:
                 # perfect, we can just return the user for it
-                t = get_user(check_arg, CONSOLE2ID[console])
+                t = get_user(check_arg, CONSOLE2ID[console], cached=cached)
             else:
                 # not perfect, but give it a shot
-                t = get_user(check_arg)
+                t = get_user(check_arg, cached=cached)
 
             if not isinstance(t, str):
                 # XXX: Right now, the only string returned is "A user by
@@ -349,7 +377,7 @@ def compile_stats_arg_parse(text_arr, given_nick):
 
     # If we didn't get a nick, assume the requester.
     if not nick:
-        user = get_user(given_nick, CONSOLE2ID[console]) if console else get_user(given_nick)
+        user = get_user(given_nick, CONSOLE2ID[console], cached=cached) if console else get_user(given_nick, cached=cached)
         if not isinstance(user, str):
            nick = given_nick
         else:
@@ -390,17 +418,6 @@ def pve(text, nick, bot, notice):
         st_type='allPvE',
         notice=notice
     )
-
-@hook.command('save')
-def save_cache():
-    output = 'Neither cache saved'
-    with open('destiny_cache', 'wb') as f:
-        dump(CACHE, f)
-        output = ['Main cache saved']
-    with open('lore_cache', 'wb') as f:
-        dump(LORE_CACHE, f)
-        output.append('Lore cache saved')
-    return output
 
 
 @hook.command('item')
@@ -513,11 +530,14 @@ def weekly(text,bot):
 
 @hook.command('nightfall')
 def nightfall(text, bot):
-    if CACHE.get('nightfall', None) and not text.lower() == 'flush':
+    global CACHE
+    curr_nf = CACHE.get(DB_Q.nightfall.exists())
+    last_nf = CACHE.get(DB_Q.last_nightfall.exists())
+    if curr_nf and not text.lower() == 'flush':
         if 'last' in text.lower():
-            return CACHE.get('last_nightfall', 'Unavailable')
+            return last_nf['last_nightfall'] or 'Unavailable'
         else:
-            return CACHE['nightfall']
+            return curr_nf['nightfall']
     else:
         advisors = get(
             '{}advisors/?definitions=true'.format(BASE_URL),
@@ -533,18 +553,24 @@ def nightfall(text, bot):
             nightfallDefinition['activityDescription'],
             ', '.join([advisors['Response']['definitions']['activities'][str(nightfallActivityBundleHashId)]['skulls'][skullId]['displayName'] for skullId in advisors['Response']['data']['nightfall']['tiers'][0]['skullIndexes']])
         )
-        if 'nightfall' in CACHE and output != CACHE['nightfall']:
-            CACHE['last_nightfall'] = CACHE['nightfall']
-        CACHE['nightfall'] = output
+        if curr_nf:
+            if curr_nf['nightfall'] != output:
+                CACHE.remove(q.last_nightfall.exists())
+                CACHE.insert({'last_nightfall': curr_nf['nightfall']})
+            CACHE.update({'nightfall': output}, eids=[curr_nf.eid])
+        else:
+            CACHE.insert({'nightfall': output})
         return output
 
 @hook.command('coe')
 def coe(text,bot):
-    if CACHE.get('coe', None) and text.lower() not in ['flush', 'clear', 'purge']:
+    global CACHE
+    curr_coe = CACHE.get(DB_Q.coe.exists())
+    if curr_coe and text.lower() not in ['flush', 'clear', 'purge']:
         if 'last' in text.lower():
-            return CACHE.get('last_coe', 'Unavailable')
+            return CACHE.get(DB_Q.last_coe.exists()).get('last_coe', 'Unavailable')
         else:
-            return CACHE['coe']
+            return curr_coe['coe']
     else:
         advisor = get('{}advisors/V2/?definitions=true'.format(BASE_URL),headers=HEADERS).json()['Response']['data']['activities']['elderchallenge']
         modifiers = []
@@ -562,8 +588,10 @@ def coe(text,bot):
 
 @hook.command('xur')
 def xur(text, bot):
+    global CACHE
     if 'last' in text.lower():
-        return CACHE.get('last_xur', 'Unavailable')
+        # return the last xur if it exists. If not return 'Unavailable'
+        return CACHE.get(DB_Q.last_xur.exists()).get('xur', 'Unavailable')
 
     # reset happens at 9am UTC, so subtract that to simplify the math
     now = datetime.datetime.utcnow() - datetime.timedelta(hours=9)
@@ -592,8 +620,9 @@ def xur(text, bot):
 
         return '\x02Xûr will return in\x02 {}'.format(', '.join(output))
 
-    if CACHE.get('xur', None) and not text.lower() == 'flush':
-        return CACHE['xur']
+    curr_xur = CACHE.get(DB_Q.xur.exists())
+    if curr_xur and not text.lower() == 'flush':
+        return curr_xur['xur']
 
     xurStock = get(
         '{}Advisors/Xur/?definitions=true'.format(BASE_URL),
@@ -615,9 +644,13 @@ def xur(text, bot):
         ))
     output = ', '.join(output)
 
-    if output != CACHE.get('xur', output):
-        CACHE['last_xur'] = CACHE['xur']
-    CACHE['xur'] = output
+    if curr_xur:
+        if output != curr_xur['xur']:
+            CACHE.remove(DB_Q.last_xur.exists())
+            CACHE.insert({'last_xur': curr_xur['xur']})
+            CACHE.update({'xur': output}, eids=[curr_xur.eid])
+    else:
+        CACHE.insert({'xur': output})
     return output
 
 @hook.command('armsday')
@@ -669,47 +702,42 @@ def armsday(text, bot):
 
 
 @hook.command('lore')
-def lore(text, bot, notice):
-    if not LORE_CACHE or text.lower() == 'flush':  # if the cache doesn't exist, create it
+def lore(bot, notice, text=''):
+    global LORE
+    if len(LORE) < 10 or text.lower() == 'flush':  # if we need to make a new cache
         prepare_lore_cache()
         text = ''
-    complete = False
-    if 'complete' in text:
-        complete = True
+    complete = 'complete' in text
+    if complete:
         text = text.replace('complete', '').strip()
 
-    name = ''
     if not text:  # if we aren't searching, return a random card
-        name = sample(list(LORE_CACHE), 1)[0]
-        while name == 'grim_tally':
-            name = sample(list(LORE_CACHE), 1)[0]
+        card = sample(LORE.search(~DB_Q.cardName == 'grim_tally', 1))[0]
     else:
         matches = []
-        for entry in LORE_CACHE:
-            if entry == 'grim_tally':
-                continue
-            if text.lower() == entry.lower():
-                name = entry
-            elif text.lower() in entry.lower() or text.lower() in LORE_CACHE[entry].get('cardDescription', '').lower():
-                matches.append(entry)
-        if not name:
+        card = LORE.get(DB_Q.cardName.search(text))
+        if not card:
+            matches.extend(LORE.search(
+                DB_Q.cardName.test(in_lower, text) |
+                DB_Q.cardIntro.test(in_lower, text) |
+                DB_Q.cardDescription.test(in_lower, text)))
             if len(matches) == 1:
-                name = matches[0]
+                card = matches[0]
             elif len(matches) == 0:
                 return 'I ain\'t found shit!'
             elif complete:
                 notice('I found {} matches. You can choose from:'.format(len(matches)))
                 for line in matches:
-                    notice(line)
+                    notice(line['cardName'])
                 return
             else:
                 return ('I found {} matches, please be more specific '
                         '(e.g. {}). For a complete list use \'complete\''.format(
-                            len(matches), ', '.join(matches[:3])))
+                            len(matches), ', '.join(
+                                [match['cardName'] for match in matches[:3]])))
 
-    contents = LORE_CACHE[name]  # get the actual card contents
     output = strip_tags('{}: {} - {}'.format(
-        name, contents.get('cardIntro', ''), contents.get('cardDescription', '')))
+        card['cardName'], card.get('cardIntro', ''), card.get('cardDescription', '')))
 
     if complete:
         notice(output)
@@ -722,9 +750,10 @@ def lore(text, bot, notice):
 
 @hook.command('collection')
 def collection(text, nick, bot):
+    global LINKS
     text = nick if not text else text
     membership = get_user(text)
-    links = CACHE['links'].get(nick)
+    links = LINKS.get(DB_Q.nick == text)
 
     if type(membership) == str:
         return membership
@@ -739,12 +768,12 @@ def collection(text, nick, bot):
         ).json()['Response']['data']
         found_frags = []
         ghosts = 0
+        fragments = COLLECTIONS.get(DB_Q.fragments.exists())['fragments']
+        if not fragments:
+            prepare_lore_cache()
+            fragments = COLLECTIONS.get(DB_Q.fragments.exists())['fragments']
         for card in grimoire['cardCollection']:
-            if 'fragments' not in CACHE['collections']:
-                # XXX: don't allow !collections to be broken
-                # because of bad cache
-                prepare_lore_cache()
-            if card['cardId'] in CACHE['collections']['fragments']:
+            if card['cardId'] in fragments:
                 found_frags.append([card['cardId']])
             elif card['cardId'] == 103094:
                 ghosts = card['statisticCollection'][0]['displayValue']
@@ -759,11 +788,11 @@ def collection(text, nick, bot):
         output.append('{}: Grimoire {}/{}, Ghosts {}/{}, Fragments {}/{} - {}'.format(
             CONSOLES[console - 1],
             grimoire['score'],
-            CACHE['collections']['grim_tally'],
+            COLLECTIONS.get(DB_Q.grim_tally.exists())['grim_tally'],
             ghosts,
-            CACHE['collections']['ghost_tally'],
+            COLLECTIONS.get(DB_Q.ghost_tally.exists())['ghost_tally'],
             len(found_frags),
-            len(CACHE['collections']['fragments']),
+            len(fragments),
             try_shorten('http://destinystatus.com/{}/{}/grimoire'.format(
                 platform,
                 links[console]
@@ -773,6 +802,7 @@ def collection(text, nick, bot):
 
 @hook.command('link')
 def link(text, nick, bot, notice):
+    global LINKS
     text = text.lower().split(' ')
     err_msg = 'Invalid use of link command. Use: !link <gamertag> <xbl/psn>'
 
@@ -782,32 +812,31 @@ def link(text, nick, bot, notice):
         return
 
     # Check that single arg is correct
-    if len(text) == 1 and text[0] not in 'flush':
+    if len(text) == 1 and text[0] != 'flush':
         notice(err_msg)
         return
 
-    # Remove any previous cached char info
-    CACHE[nick] = {}
-
-    # If nick doesn't exist in cache, or we flush, reset cache value
-    if not CACHE['links'].get(nick, None) or 'flush' in text:
-        CACHE['links'][nick] = {}
-
-    # Only give flush message if we flush
+    # Clear all links if we need to flush
     if 'flush' in text:
+        LINKS.remove(DB_Q.nick == nick)
         return '{} flushed from my cache'.format(nick)
 
     platform = text[1]
     gamertag = text[0]
-
-    if platform not in ['psn', 'xbl']: # Check for a valid console
+    current = LINKS.get(DB_Q.nick == nick)
+    if not current:
+        LINKS.insert({'nick': nick})
+        current = LINKS.get(DB_Q.nick == nick)
+    if platform not in ['psn', 'xbl']:  # Check for a valid platform
         notice(err_msg)
         return
     elif platform == 'psn':
-        CACHE['links'][nick][2] = gamertag
+        current[2] = gamertag
+        LINKS.update(current, eids=[current.eid])
         return '{} linked to {} on Playstation'.format(gamertag, nick)
     elif platform == 'xbl':
-        CACHE['links'][nick][1] = gamertag
+        current[1] = gamertag
+        LINKS.update(current, eids=[current.eid])
         return '{} linked to {} on Xbox'.format(gamertag, nick)
     else:
         notice(err_msg)
@@ -815,34 +844,45 @@ def link(text, nick, bot, notice):
 
 @hook.command('migrate')
 def migrate(text, nick, bot):
+    global LINKS
     if nick in ['weylin', 'avcables', 'DoctorRaptorMD[XB1]', 'tuzonghua']:
         global CACHE
-        CACHE = {'links': CACHE['links']}
-        return 'Sucessfully migrated! Now run the save command.'
+        from pickle import load
+        try:
+            with open('destiny_cache', 'rb') as f:
+                old_cache = load(f)  # load this old crap!
+                for old_link in old_cache['links']:
+                    if not LINKS.get(DB_Q.nick == old_link):
+                        eid = LINKS.insert({'nick': old_link})
+                        LINKS.update(old_cache['links'][old_link], eids=[eid])
+            return 'Sucessfully migrated!'
+        except:
+            return "Couldn't load the old cache. Make sure 'destiny_cache' exists."
+
     else:
         return 'Your light is not strong enough.'
 
 @hook.command('purge')
 def purge(text, nick, bot):
+    global USERS
     membership = get_user(nick)
 
     if type(membership) is not dict:
         return membership
-    user_name = nick
     output = []
     text = '' if not text else text
-
+    user = USERS.get(DB_Q.nick == nick)
     if text.lower() == 'xbl' and membership.get(1, False):
         del membership[1]
-        output.append('Removed Xbox from my cache on {}.'.format(user_name))
+        output.append('Removed Xbox from my cache on {}.'.format(nick))
     if text.lower() == 'psn' and membership.get(2, False):
         del membership[2]
-        output.append('Removed Playstation from my cache on {}.'.format(user_name))
+        output.append('Removed Playstation from my cache on {}.'.format(nick))
     if not text or not membership:
-        del CACHE[user_name]
+        USERS.remove(DB_Q.nick == nick)
         return 'Removed {}\'s characters from my cache.'.format(nick)
     else:
-        CACHE[user_name] = membership
+        USERS.update({nick: membership}, eids=[user.eid])
         return output if output else 'Nothing to purge. WTF you doin?!'
 
 @hook.command('profile')
@@ -875,7 +915,7 @@ def chars(text, nick, bot, notice):
 
     err_msg = 'Invalid use of chars command. Use: !chars <nick> or !chars <gamertag> <psn/xbl>'
 
-    target = compile_stats_arg_parse(text, nick)
+    target = compile_stats_arg_parse(text, nick, cached=False)
     if target['stats'] or target['split']:
         return err_msg
 
@@ -932,11 +972,36 @@ def clan(bot):
     return 'Check out our Clan: https://www.bungie.net/en/Clan/Detail/939927'
 
 @hook.command('news')
-def news(bot):
-    feed = parse('https://www.bungie.net/en/Rss/NewsByCategory?category=destiny&currentpage=1&itemsPerPage=1')
+def news(bot, chan, text=None):
+    global CACHE
+    if text:
+        channels = CACHE.get(DB_Q.channels.exists())
+        if 'unsubscribe' in text.lower():
+            if channels:
+                if chan in channels['channels']:
+                    channels['channels'].remove(chan)
+                    CACHE.update(channels, eids=[channels.eid])
+                    return 'Successfully unsubscribed!'
+        elif 'subscribe' in text.lower():
+            if not channels:
+                CACHE.insert({'channels': [chan]})
+            elif chan not in channels['channels']:
+                channels['channels'].append(chan)
+                CACHE.update(channels, eids=[channels.eid])
+                return 'Successfully subscribed!'
+    feed = parse('https://www.bungie.net/en/rss/News?currentpage=1')
     if not feed.entries:
         return 'Feed not found.'
-
-    return '{} - {}'.format(
-        feed['entries'][0]['summary'],
-        try_shorten(feed['entries'][0]['link']))
+    else:
+        posts = []
+        for i in range(0,len(feed['entries'])):
+            posts.append({
+            'title': feed['entries'][i].title,
+            'description': feed['entries'][i].summary,
+            'url': feed['entries'][i].link,
+            })
+        return '{} // {} // {}'.format(
+            posts[0]['title'],
+            posts[0]['description'],
+            try_shorten(posts[0]['url']))
+    return True
